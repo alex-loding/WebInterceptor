@@ -453,7 +453,7 @@ public class MainForm : Form
                     $"HTTP 服务启动失败，当前端口 {AppConfig.Port} 无法监听。\n{serverError}",
                     "WebInterceptor",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
+                    MessageBoxIcon.None);
             }
             InitTray();
             // 启动统计刷新定时器（每秒刷新一次）
@@ -2126,6 +2126,7 @@ public class MainForm : Form
 
         (WebView2 WebView, int InstanceId, SemaphoreSlim LeaseSemaphore)? webViewWithId = null;
         InterceptRequest? req = null;
+        bool immediateReturnedEarly = false;
         try
         {
             try
@@ -2217,7 +2218,20 @@ public class MainForm : Form
                 else
                 {
                     // 立即返回模式：保持原有逻辑
-                    await HandleImmediateReturnMode(ctx, webView, instanceId, req);
+                    await HandleImmediateReturnMode(ctx, webView, instanceId, req, () =>
+                    {
+                        if (immediateReturnedEarly || webViewWithId == null) return;
+                        _instanceStatus[webViewWithId.Value.InstanceId] = "idle";
+                        bool navigateToBlankEarly = !(req?.keep_page ?? false);
+                        ReturnWebViewToPool(
+                            webViewWithId.Value.WebView,
+                            webViewWithId.Value.InstanceId,
+                            webViewWithId.Value.LeaseSemaphore,
+                            navigateToBlankEarly);
+                        webViewWithId = null;
+                        immediateReturnedEarly = true;
+                        Log($"实例 #{instanceId} 已提前归还（立即返回模式）", LogLevel.Debug);
+                    });
                 }
             }
         }
@@ -2265,6 +2279,38 @@ public class MainForm : Form
             }
             
             _requestSemaphore.Release();
+        }
+    }
+
+    private async Task<bool> TryWriteResponseBytesAsync(
+        HttpListenerContext ctx,
+        int instanceId,
+        byte[] payload,
+        int timeoutSeconds,
+        string phase)
+    {
+        timeoutSeconds = Math.Clamp(timeoutSeconds, 1, 300);
+
+        try
+        {
+            var writeTask = ctx.Response.OutputStream.WriteAsync(payload).AsTask();
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(timeoutSeconds));
+            var completed = await Task.WhenAny(writeTask, timeoutTask);
+
+            if (completed == writeTask)
+            {
+                await writeTask;
+                return true;
+            }
+
+            Log($"实例 #{instanceId}  响应写入超时({timeoutSeconds}s)  阶段:{phase}，已中止连接", LogLevel.Warning);
+            try { ctx.Response.Abort(); } catch { }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log($"实例 #{instanceId}  响应写入失败  阶段:{phase}: {ex.Message}", LogLevel.Warning);
+            return false;
         }
     }
 
@@ -2534,10 +2580,16 @@ public class MainForm : Form
             Log($"实例 #{instanceId}  会话结束", LogLevel.Debug);
         }
     }
-    private async Task HandleImmediateReturnMode(HttpListenerContext ctx, WebView2 webView, int instanceId, InterceptRequest req)
+    private async Task HandleImmediateReturnMode(
+        HttpListenerContext ctx,
+        WebView2 webView,
+        int instanceId,
+        InterceptRequest req,
+        Action? releaseInstanceEarly = null)
     {
         // 用 TaskCompletionSource 等待第一条拦截数据，拿到后立刻关闭连接
         var tcs = new TaskCompletionSource<string>();
+        int writeTimeoutSeconds = Math.Clamp(Math.Min(req.timeout_seconds ?? 60, 15), 5, 15);
 
         // 使用配置的是否包含body，默认为true
         bool includeBody = req.include_body ?? true;
@@ -2592,14 +2644,29 @@ public class MainForm : Form
         {
             // 等第一条数据，拿到后立刻返回给客户端并关闭连接
             var result = await tcs.Task;
+            try
+            {
+                releaseInstanceEarly?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Log($"实例 #{instanceId}  提前归还失败: {ex.Message}", LogLevel.Warning);
+            }
 
             var bytes = Encoding.UTF8.GetBytes(result);
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "application/json; charset=utf-8";
             ctx.Response.ContentLength64 = bytes.Length;
-            await ctx.Response.OutputStream.WriteAsync(bytes);
-            Log($"实例 #{instanceId}  数据已返回客户端", LogLevel.Success);
-            Interlocked.Increment(ref _statSuccess);
+            if (await TryWriteResponseBytesAsync(ctx, instanceId, bytes, writeTimeoutSeconds, "immediate-success"))
+            {
+                Log($"实例 #{instanceId}  数据已返回客户端", LogLevel.Success);
+                Interlocked.Increment(ref _statSuccess);
+            }
+            else
+            {
+                Log($"实例 #{instanceId}  数据写回失败（客户端可能读取缓慢或连接中断）", LogLevel.Warning);
+                Interlocked.Increment(ref _statFailed);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -2608,7 +2675,7 @@ public class MainForm : Form
             var errorMsg = JsonSerializer.Serialize(new { error = "拦截失败", message = $"{timeoutSeconds}秒内未拦截到数据" });
             var bytes = Encoding.UTF8.GetBytes(errorMsg);
             ctx.Response.ContentLength64 = bytes.Length;
-            await ctx.Response.OutputStream.WriteAsync(bytes);
+            await TryWriteResponseBytesAsync(ctx, instanceId, bytes, writeTimeoutSeconds, "immediate-timeout");
             Log($"实例 #{instanceId}  超时：{timeoutSeconds}s 内未拦截到数据", LogLevel.Error);
             Interlocked.Increment(ref _statTimeout);
         }
@@ -2619,13 +2686,13 @@ public class MainForm : Form
             var errorMsg = JsonSerializer.Serialize(new { error = "拦截失败", message = ex.Message });
             var bytes = Encoding.UTF8.GetBytes(errorMsg);
             ctx.Response.ContentLength64 = bytes.Length;
-            await ctx.Response.OutputStream.WriteAsync(bytes);
+            await TryWriteResponseBytesAsync(ctx, instanceId, bytes, writeTimeoutSeconds, "immediate-exception");
             Log($"实例 #{instanceId}  输出异常: {ex.Message}", LogLevel.Error);
             Interlocked.Increment(ref _statFailed);
         }
         finally
         {
-            ctx.Response.Close();
+            try { ctx.Response.Close(); } catch { }
             Log($"实例 #{instanceId}  会话结束", LogLevel.Debug);
         }
     }
