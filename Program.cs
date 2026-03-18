@@ -6,6 +6,12 @@ using System.Threading.Tasks.Dataflow;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
+internal enum LogDisplayMode
+{
+    Full,
+    Simple
+}
+
 // ═════════════════════════════════════════════
 // 读取 config.ini
 // ═════════════════════════════════════════════
@@ -13,6 +19,7 @@ internal static class AppConfig
 {
     public static int Port { get; set; } = 8888;
     public static int InstanceCount { get; set; } = 5;
+    public static LogDisplayMode LogDisplayMode { get; set; } = LogDisplayMode.Full;
 
     public static void Load()
     {
@@ -30,6 +37,13 @@ internal static class AppConfig
                 Port = port;
             if (key == "instance_count" && int.TryParse(val, out var count) && count >= 1 && count <= 20)
                 InstanceCount = count;
+            if (key == "display_mode")
+            {
+                if (string.Equals(val, "simple", StringComparison.OrdinalIgnoreCase))
+                    LogDisplayMode = LogDisplayMode.Simple;
+                else
+                    LogDisplayMode = LogDisplayMode.Full;
+            }
         }
     }
 
@@ -37,13 +51,16 @@ internal static class AppConfig
     public static void Save()
     {
         var iniPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
+        const string nl = "\r\n";
         File.WriteAllText(iniPath,
-            "; WebInterceptor 配置文件\n" +
-            "; 修改后重启程序生效\n\n" +
-            "[server]\n" +
-            $"port = {Port}\n\n" +
-            "[webview2]\n" +
-            $"instance_count = {InstanceCount}\n");
+            "; WebInterceptor 配置文件" + nl +
+            "; 修改后重启程序生效" + nl + nl +
+            "[server]" + nl +
+            $"port = {Port}" + nl + nl +
+            "[webview2]" + nl +
+            $"instance_count = {InstanceCount}" + nl + nl +
+            "[log]" + nl +
+            $"display_mode = {(LogDisplayMode == LogDisplayMode.Simple ? "simple" : "full")}" + nl);
     }
 }
 
@@ -170,6 +187,7 @@ public class MainForm : Form
     private Task? _httpServerLoopTask;
     private readonly object _httpServerLock = new();
     private RichTextBox _logBox = null!;
+    private ComboBox _logModeCombo = null!;
     private NotifyIcon _trayIcon = null!;
     private TabControl _tabControl = null!;
     private bool _realExit = false;
@@ -472,10 +490,45 @@ public class MainForm : Form
         clearBtn.FlatAppearance.BorderSize            = 0;
         clearBtn.FlatAppearance.MouseOverBackColor    = Color.FromArgb(55, 55, 55);
         clearBtn.FlatAppearance.MouseDownBackColor    = Color.FromArgb(70, 70, 70);
-        clearBtn.Click += (_, _) => _logBox.Clear();
+        clearBtn.Click += (_, _) => ClearLogs();
+
+        var logModeLabel = new Label
+        {
+            Text      = "模式",
+            Dock      = DockStyle.Right,
+            Width     = 40,
+            ForeColor = clrTextDim,
+            Font      = fontUI,
+            TextAlign = ContentAlignment.MiddleCenter,
+        };
+
+        _logModeCombo = new ComboBox
+        {
+            Dock          = DockStyle.Right,
+            Width         = 88,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            FlatStyle     = FlatStyle.Flat,
+            Font          = fontUI,
+            BackColor     = Color.FromArgb(32, 32, 32),
+            ForeColor     = clrText,
+        };
+        _logModeCombo.Items.AddRange(new object[] { "完整", "简化" });
+        _logModeCombo.SelectedIndex = AppConfig.LogDisplayMode == LogDisplayMode.Simple ? 1 : 0;
+        _logModeCombo.SelectedIndexChanged += (_, _) =>
+        {
+            var selectedMode = _logModeCombo.SelectedIndex == 1 ? LogDisplayMode.Simple : LogDisplayMode.Full;
+            if (_logDisplayMode == selectedMode) return;
+
+            _logDisplayMode = selectedMode;
+            AppConfig.LogDisplayMode = selectedMode;
+            AppConfig.Save();
+            RebuildLogView();
+        };
 
         logHeader.Controls.Add(logTitle);
         logHeader.Controls.Add(clearBtn);
+        logHeader.Controls.Add(_logModeCombo);
+        logHeader.Controls.Add(logModeLabel);
 
         _logBox = new RichTextBox
         {
@@ -612,6 +665,13 @@ public class MainForm : Form
 
     // ── 日志级别 ──
     private enum LogLevel { Info, Success, Warning, Error, Request, Navigate, Intercept, Data, Debug }
+    private readonly record struct LogEntry(
+        string TimeStr,
+        string MessageStr,
+        Color MessageColor,
+        LogLevel Level,
+        bool ShowInFullMode,
+        bool ShowInSimpleMode);
 
     // ── 更新程序标题（显示任务计数） ──
     private void UpdateWindowTitle()
@@ -1168,12 +1228,114 @@ public class MainForm : Form
     }
 
     // ── 日志队列，用于批量处理日志，避免频繁UI调用 ──
-    private readonly ConcurrentQueue<(string timeStr, string msgStr, Color msgColor)> _logQueue = new();
+    private readonly ConcurrentQueue<LogEntry> _logQueue = new();
+    private readonly List<LogEntry> _logHistory = new();
+    private readonly object _logHistoryLock = new();
+    private LogDisplayMode _logDisplayMode = AppConfig.LogDisplayMode;
     private System.Windows.Forms.Timer? _logFlushTimer;
     private readonly object _logFlushTimerLock = new();
     private bool _logFlushRunning = false;
-    private const int MaxLogLines = 5000;
-    private const int LogTrimToLines = 4500;
+    private const int MaxLogLines = 500;
+    private const int LogTrimToLines = 400;
+    private const int MaxLogHistoryEntries = 5000;
+    private const string LogLineBreak = "\r\n";
+
+    private static Color GetLogColor(LogLevel level)
+    {
+        return level switch
+        {
+            LogLevel.Success   => Color.FromArgb( 78, 201, 176),
+            LogLevel.Warning   => Color.FromArgb(220, 166,  60),
+            LogLevel.Error     => Color.FromArgb(241,  76,  76),
+            LogLevel.Request   => Color.FromArgb( 86, 156, 214),
+            LogLevel.Navigate  => Color.FromArgb( 79, 193, 255),
+            LogLevel.Intercept => Color.FromArgb(197, 134, 192),
+            LogLevel.Data      => Color.FromArgb( 78, 201, 176),
+            LogLevel.Debug     => Color.FromArgb( 90,  90,  90),
+            _                  => Color.FromArgb(180, 180, 180),
+        };
+    }
+
+    private static bool IsImportantSimpleLifecycleLog(string message)
+    {
+        return message.Contains("HTTP 服务启动", StringComparison.Ordinal) ||
+               message.Contains("HTTP 服务已重启", StringComparison.Ordinal) ||
+               message.Contains("WebView2 实例池调整中", StringComparison.Ordinal) ||
+               message.Contains("WebView2 实例池就绪", StringComparison.Ordinal) ||
+               message.Contains("实例池不可用", StringComparison.Ordinal) ||
+               message.Contains("尝试自动重建", StringComparison.Ordinal) ||
+               message.Contains("自动重建完成", StringComparison.Ordinal) ||
+               message.Contains("配置已保存", StringComparison.Ordinal) ||
+               message.Contains("临时实例", StringComparison.Ordinal);
+    }
+
+    private static bool IsSuppressedSimpleWarning(string message)
+    {
+        return message.Contains("等待页面加载完成", StringComparison.Ordinal) ||
+               message.Contains("等待图片响应", StringComparison.Ordinal) ||
+               message.Contains("等待拦截", StringComparison.Ordinal) ||
+               message.Contains("等待完整加载", StringComparison.Ordinal) ||
+               message.Contains("  命中  ", StringComparison.Ordinal);
+    }
+
+    private static string FormatLogBytes(long bytes)
+    {
+        const double kilobyte = 1024d;
+        const double megabyte = 1024d * 1024d;
+
+        if (bytes >= megabyte)
+            return $"{bytes / megabyte:0.0} MB";
+
+        if (bytes >= kilobyte)
+            return $"{bytes / kilobyte:0.0} KB";
+
+        return $"{bytes} B";
+    }
+
+    private static string FormatElapsedTime(TimeSpan elapsed)
+    {
+        return elapsed.TotalSeconds >= 1
+            ? $"{elapsed.TotalSeconds:0.0} s"
+            : $"{Math.Max(1, elapsed.TotalMilliseconds):0} ms";
+    }
+
+    private void EnqueueLog(
+        string message,
+        Color color,
+        LogLevel level,
+        bool showInFullMode = true,
+        bool showInSimpleMode = false)
+    {
+        var time = DateTime.Now.ToString("HH:mm:ss.fff");
+        var tStr = $"[{time}]";
+        var mStr = $"  {message}{LogLineBreak}";
+        _logQueue.Enqueue(new LogEntry(tStr, mStr, color, level, showInFullMode, showInSimpleMode));
+
+        EnsureLogFlushTimerStarted();
+    }
+
+    private void LogSimpleSummary(string message, LogLevel level)
+    {
+        EnqueueLog(message, GetLogColor(level), level, showInFullMode: false, showInSimpleMode: true);
+    }
+
+    private void LogRequestEnterSummary(int instanceId, string requestKind, string url)
+    {
+        LogSimpleSummary($"请求进入 | 实例 #{instanceId} | {requestKind} | {url}", LogLevel.Request);
+    }
+
+    private void LogRequestCompleteSummary(
+        int instanceId,
+        string resultKind,
+        long payloadBytes,
+        System.Diagnostics.Stopwatch requestStopwatch,
+        int? matchedCount = null)
+    {
+        var matchedText = matchedCount.HasValue ? $" | 匹配 {matchedCount.Value} 项" : string.Empty;
+        LogSimpleSummary(
+            $"请求完成 | 实例 #{instanceId}{matchedText} | {resultKind} {FormatLogBytes(payloadBytes)} | {FormatElapsedTime(requestStopwatch.Elapsed)}",
+            LogLevel.Success);
+    }
 
     private void EnsureLogFlushTimerStarted()
     {
@@ -1190,27 +1352,74 @@ public class MainForm : Form
         }
     }
 
+    private bool ShouldDisplayLog(LogEntry entry)
+    {
+        if (_logDisplayMode == LogDisplayMode.Full)
+            return entry.ShowInFullMode;
+
+        if (entry.ShowInSimpleMode)
+            return true;
+
+        if (!entry.ShowInFullMode)
+            return false;
+
+        if (entry.Level == LogLevel.Error)
+            return true;
+
+        if (entry.Level == LogLevel.Warning)
+            return !IsSuppressedSimpleWarning(entry.MessageStr);
+
+        return IsImportantSimpleLifecycleLog(entry.MessageStr);
+    }
+
+    private void AddLogToHistory(LogEntry entry)
+    {
+        lock (_logHistoryLock)
+        {
+            _logHistory.Add(entry);
+            if (_logHistory.Count > MaxLogHistoryEntries)
+            {
+                _logHistory.RemoveRange(0, _logHistory.Count - MaxLogHistoryEntries);
+            }
+        }
+    }
+
+    private void ClearLogs()
+    {
+        _logQueue.Clear();
+        lock (_logHistoryLock)
+        {
+            _logHistory.Clear();
+        }
+
+        _logBox.Clear();
+    }
+
+    private void RebuildLogView()
+    {
+        _logBox.Clear();
+
+        List<LogEntry> snapshot;
+        lock (_logHistoryLock)
+        {
+            snapshot = _logHistory
+                .Where(ShouldDisplayLog)
+                .ToList();
+        }
+
+        foreach (var entry in snapshot)
+        {
+            AppendLog(entry.TimeStr, entry.MessageStr, entry.MessageColor, false);
+        }
+
+        if (_logBox.TextLength > 0)
+            _logBox.ScrollToCaret();
+    }
+
     // ── 日志输出（线程安全，使用队列批量处理）──
     private void Log(string message, LogLevel level = LogLevel.Info)
     {
-        Color c = level switch
-        {
-            LogLevel.Success   => Color.FromArgb( 78, 201, 176),
-            LogLevel.Warning   => Color.FromArgb(220, 166,  60),
-            LogLevel.Error     => Color.FromArgb(241,  76,  76),
-            LogLevel.Request   => Color.FromArgb( 86, 156, 214),
-            LogLevel.Navigate  => Color.FromArgb( 79, 193, 255),
-            LogLevel.Intercept => Color.FromArgb(197, 134, 192),
-            LogLevel.Data      => Color.FromArgb( 78, 201, 176),
-            LogLevel.Debug     => Color.FromArgb( 90,  90,  90),
-            _                  => Color.FromArgb(180, 180, 180),
-        };
-        var time = DateTime.Now.ToString("HH:mm:ss.fff");
-        var tStr = $"[{time}]";
-        var mStr = $"  {message}\n";
-        _logQueue.Enqueue((tStr, mStr, c));
-
-        EnsureLogFlushTimerStarted();
+        EnqueueLog(message, GetLogColor(level), level);
     }
 
     // ── 批量刷新日志队列到UI ──
@@ -1226,7 +1435,9 @@ public class MainForm : Form
             
             while (count < maxPerFlush && _logQueue.TryDequeue(out var item))
             {
-                AppendLog(item.timeStr, item.msgStr, item.msgColor);
+                AddLogToHistory(item);
+                if (ShouldDisplayLog(item))
+                    AppendLog(item.TimeStr, item.MessageStr, item.MessageColor);
                 count++;
             }
         }
@@ -1239,15 +1450,10 @@ public class MainForm : Form
     // 兼容旧的 Color 重载
     private void Log(string message, Color color)
     {
-        var time = DateTime.Now.ToString("HH:mm:ss.fff");
-        var tStr = $"[{time}]";
-        var mStr = $"  {message}\n";
-        _logQueue.Enqueue((tStr, mStr, color));
-
-        EnsureLogFlushTimerStarted();
+        EnqueueLog(message, color, LogLevel.Info);
     }
 
-    private void AppendLog(string timeStr, string msgStr, Color msgColor)
+    private void AppendLog(string timeStr, string msgStr, Color msgColor, bool scrollToEnd = true)
     {
         var dimGray = Color.FromArgb(75, 75, 75);
         _logBox.SelectionStart  = _logBox.TextLength;
@@ -1257,7 +1463,8 @@ public class MainForm : Form
         _logBox.SelectionColor  = msgColor;
         _logBox.AppendText(msgStr);
         TrimLogIfNeeded();
-        _logBox.ScrollToCaret();
+        if (scrollToEnd)
+            _logBox.ScrollToCaret();
     }
 
     private void TrimLogIfNeeded()
@@ -2520,7 +2727,7 @@ public class MainForm : Form
             if (string.IsNullOrWhiteSpace(req.Filter))
             {
                 Log($"实例 #{instanceId}  Filter 为空，本次不会进入资源拦截，按目标类型返回页面或图片数据", LogLevel.Request);
-                await HandleNoFilterMode(ctx, webView, instanceId, req);
+                await HandleNoFilterMode(ctx, webView, instanceId, req, _reqStartTime);
             }
             else
             {
@@ -2530,12 +2737,12 @@ public class MainForm : Form
                 if (waitForComplete)
                 {
                     // 完整加载模式：收集所有匹配内容
-                    await HandleCompleteLoadMode(ctx, webView, instanceId, req);
+                    await HandleCompleteLoadMode(ctx, webView, instanceId, req, _reqStartTime);
                 }
                 else
                 {
                     // 立即返回模式：保持原有逻辑
-                    await HandleImmediateReturnMode(ctx, webView, instanceId, req, () =>
+                    await HandleImmediateReturnMode(ctx, webView, instanceId, req, _reqStartTime, () =>
                     {
                         if (immediateReturnedEarly || webViewWithId == null) return;
                         _instanceStatus[webViewWithId.Value.InstanceId] = "idle";
@@ -2632,13 +2839,21 @@ public class MainForm : Form
     }
 
     // 无Filter模式：导航到目标URL，等待加载完成后返回完整网页HTML
-    private async Task HandleNoFilterMode(HttpListenerContext ctx, WebView2 webView, int instanceId, InterceptRequest req)
+    private async Task HandleNoFilterMode(
+        HttpListenerContext ctx,
+        WebView2 webView,
+        int instanceId,
+        InterceptRequest req,
+        System.Diagnostics.Stopwatch requestStopwatch)
     {
         int timeoutSeconds = req.timeout_seconds ?? 60;
         bool includeBodyRequested = req.include_body == true;
         bool includeHeadersRequested = req.include_headers == true;
         bool returnJson = includeBodyRequested || includeHeadersRequested;
         bool isImageRequest = IsSupportedDirectImageUrl(req.Url);
+        var requestKind = isImageRequest
+            ? "直返-图片"
+            : returnJson ? "直返-JSON" : "直返-HTML";
         string? requestHost = null;
         if (!isImageRequest)
         {
@@ -2650,6 +2865,7 @@ public class MainForm : Form
             catch { }
         }
 
+        LogRequestEnterSummary(instanceId, requestKind, req.Url);
         Log(
             isImageRequest
                 ? $"实例 #{instanceId}  等待图片响应  timeout={timeoutSeconds}s"
@@ -2841,6 +3057,7 @@ public class MainForm : Form
                 if (imageResponse.StatusCode >= 200 && imageResponse.StatusCode < 300)
                 {
                     Log($"实例 #{instanceId}  图片已返回客户端  status={imageResponse.StatusCode}  bytes={imageResponse.Payload.Length}", LogLevel.Success);
+                    LogRequestCompleteSummary(instanceId, "图片", imageResponse.Payload.Length, requestStopwatch);
                     Interlocked.Increment(ref _statSuccess);
                 }
                 else
@@ -2972,6 +3189,7 @@ public class MainForm : Form
                 ctx.Response.ContentLength64 = jsonBytes.Length;
                 await ctx.Response.OutputStream.WriteAsync(jsonBytes);
                 Log($"instance #{instanceId} no-filter response returned as JSON, bytes={jsonBytes.Length}", LogLevel.Success);
+                LogRequestCompleteSummary(instanceId, "JSON", jsonBytes.Length, requestStopwatch);
                 Interlocked.Increment(ref _statSuccess);
                 return;
             }
@@ -2982,6 +3200,7 @@ public class MainForm : Form
             ctx.Response.ContentLength64 = htmlBytes.Length;
             await ctx.Response.OutputStream.WriteAsync(htmlBytes);
             Log($"instance #{instanceId} HTML returned to client, bytes={htmlBytes.Length}", LogLevel.Success);
+            LogRequestCompleteSummary(instanceId, "HTML", htmlBytes.Length, requestStopwatch);
             Interlocked.Increment(ref _statSuccess);
         }
         catch (Exception ex)
@@ -3010,6 +3229,7 @@ public class MainForm : Form
         WebView2 webView,
         int instanceId,
         InterceptRequest req,
+        System.Diagnostics.Stopwatch requestStopwatch,
         Action? releaseInstanceEarly = null)
     {
         // 用 TaskCompletionSource 等待第一条拦截数据，拿到后立刻关闭连接
@@ -3055,6 +3275,7 @@ public class MainForm : Form
 
         // 在WebView2实例上直接导航，无需注册过滤器
         // WebResourceResponseReceived 会旁听所有响应，由事件处理器内部匹配 filter
+        LogRequestEnterSummary(instanceId, "拦截-立即返回", req.Url);
         webView.Invoke(() =>
         {
             Log($"实例 #{instanceId}  →  {req.Url}", LogLevel.Request);
@@ -3085,6 +3306,7 @@ public class MainForm : Form
             if (await TryWriteResponseBytesAsync(ctx, instanceId, bytes, writeTimeoutSeconds, "immediate-success"))
             {
                 Log($"实例 #{instanceId}  数据已返回客户端", LogLevel.Success);
+                LogRequestCompleteSummary(instanceId, "JSON", bytes.Length, requestStopwatch);
                 Interlocked.Increment(ref _statSuccess);
             }
             else
@@ -3123,13 +3345,19 @@ public class MainForm : Form
     }
 
     // 完整加载模式处理
-    private async Task HandleCompleteLoadMode(HttpListenerContext ctx, WebView2 webView, int instanceId, InterceptRequest req)
+    private async Task HandleCompleteLoadMode(
+        HttpListenerContext ctx,
+        WebView2 webView,
+        int instanceId,
+        InterceptRequest req,
+        System.Diagnostics.Stopwatch requestStopwatch)
     {
         // 使用配置的超时时间，默认60秒
         int timeoutSeconds = req.timeout_seconds ?? 60;
         // 使用配置的是否包含body，默认为true
         bool includeBody = req.include_body ?? true;
         bool includeHeaders = req.include_headers ?? false;
+        LogRequestEnterSummary(instanceId, "拦截-完整加载", req.Url);
         Log($"实例 #{instanceId}  等待完整加载  filter={req.Filter}  timeout={timeoutSeconds}s  包含Body: {includeBody}  包含Headers: {includeHeaders}", LogLevel.Warning);
 
         // 为完整加载模式创建数据收集列表
@@ -3231,6 +3459,7 @@ public class MainForm : Form
                     ctx.Response.ContentLength64 = bytes.Length;
                     await ctx.Response.OutputStream.WriteAsync(bytes);
                     Log($"实例 #{instanceId}  数据已返回客户端", LogLevel.Success);
+                    LogRequestCompleteSummary(instanceId, "JSON", bytes.Length, requestStopwatch, snapshot.Count);
                     Interlocked.Increment(ref _statSuccess);
                 }
                 else
