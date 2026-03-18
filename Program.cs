@@ -9,7 +9,8 @@ using Microsoft.Web.WebView2.WinForms;
 internal enum LogDisplayMode
 {
     Full,
-    Simple
+    Simple,
+    None
 }
 
 // ═════════════════════════════════════════════
@@ -40,9 +41,11 @@ internal static class AppConfig
             if (key == "display_mode")
             {
                 if (string.Equals(val, "simple", StringComparison.OrdinalIgnoreCase))
-                    LogDisplayMode = LogDisplayMode.Simple;
+                    LogDisplayMode = global::LogDisplayMode.Simple;
+                else if (string.Equals(val, "none", StringComparison.OrdinalIgnoreCase))
+                    LogDisplayMode = global::LogDisplayMode.None;
                 else
-                    LogDisplayMode = LogDisplayMode.Full;
+                    LogDisplayMode = global::LogDisplayMode.Full;
             }
         }
     }
@@ -52,6 +55,12 @@ internal static class AppConfig
     {
         var iniPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
         const string nl = "\r\n";
+        var displayMode = LogDisplayMode switch
+        {
+            global::LogDisplayMode.Simple => "simple",
+            global::LogDisplayMode.None => "none",
+            _ => "full"
+        };
         File.WriteAllText(iniPath,
             "; WebInterceptor 配置文件" + nl +
             "; 修改后重启程序生效" + nl + nl +
@@ -60,7 +69,7 @@ internal static class AppConfig
             "[webview2]" + nl +
             $"instance_count = {InstanceCount}" + nl + nl +
             "[log]" + nl +
-            $"display_mode = {(LogDisplayMode == LogDisplayMode.Simple ? "simple" : "full")}" + nl);
+            $"display_mode = {displayMode}" + nl);
     }
 }
 
@@ -512,11 +521,11 @@ public class MainForm : Form
             BackColor     = Color.FromArgb(32, 32, 32),
             ForeColor     = clrText,
         };
-        _logModeCombo.Items.AddRange(new object[] { "完整", "简化" });
-        _logModeCombo.SelectedIndex = AppConfig.LogDisplayMode == LogDisplayMode.Simple ? 1 : 0;
+        _logModeCombo.Items.AddRange(new object[] { "完整", "简化", "无" });
+        _logModeCombo.SelectedIndex = GetLogModeComboIndex(AppConfig.LogDisplayMode);
         _logModeCombo.SelectedIndexChanged += (_, _) =>
         {
-            var selectedMode = _logModeCombo.SelectedIndex == 1 ? LogDisplayMode.Simple : LogDisplayMode.Full;
+            var selectedMode = GetLogDisplayModeFromComboIndex(_logModeCombo.SelectedIndex);
             if (_logDisplayMode == selectedMode) return;
 
             _logDisplayMode = selectedMode;
@@ -631,6 +640,9 @@ public class MainForm : Form
         var showItem = new ToolStripMenuItem("显示主窗口");
         showItem.Click += (_, _) => ShowMainWindow();
 
+        var restartItem = new ToolStripMenuItem("重开");
+        restartItem.Click += (_, _) => RestartApplication();
+
         var exitItem = new ToolStripMenuItem("退出");
         exitItem.Click += (_, _) =>
         {
@@ -639,6 +651,7 @@ public class MainForm : Form
         };
 
         menu.Items.Add(showItem);
+        menu.Items.Add(restartItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
         _trayIcon.ContextMenuStrip = menu;
@@ -661,6 +674,20 @@ public class MainForm : Form
         Show();
         WindowState = FormWindowState.Normal;
         Activate();
+    }
+
+    private void RestartApplication()
+    {
+        try
+        {
+            _realExit = true;
+            Application.Restart();
+        }
+        catch (Exception ex)
+        {
+            _realExit = false;
+            Log($"程序重开失败: {ex.Message}", LogLevel.Error);
+        }
     }
 
     // ── 日志级别 ──
@@ -1269,6 +1296,14 @@ public class MainForm : Form
                message.Contains("临时实例", StringComparison.Ordinal);
     }
 
+    private static bool IsImportantNoneModeLog(string message)
+    {
+        return message.Contains("HTTP 服务启动", StringComparison.Ordinal) ||
+               message.Contains("HTTP 服务已重启", StringComparison.Ordinal) ||
+               message.Contains("WebView2 实例池调整中", StringComparison.Ordinal) ||
+               message.Contains("WebView2 实例池就绪", StringComparison.Ordinal);
+    }
+
     private static bool IsSuppressedSimpleWarning(string message)
     {
         return message.Contains("等待页面加载完成", StringComparison.Ordinal) ||
@@ -1297,6 +1332,26 @@ public class MainForm : Form
         return elapsed.TotalSeconds >= 1
             ? $"{elapsed.TotalSeconds:0.0} s"
             : $"{Math.Max(1, elapsed.TotalMilliseconds):0} ms";
+    }
+
+    private static int GetLogModeComboIndex(LogDisplayMode mode)
+    {
+        return mode switch
+        {
+            LogDisplayMode.Simple => 1,
+            LogDisplayMode.None => 2,
+            _ => 0,
+        };
+    }
+
+    private static LogDisplayMode GetLogDisplayModeFromComboIndex(int selectedIndex)
+    {
+        return selectedIndex switch
+        {
+            1 => LogDisplayMode.Simple,
+            2 => LogDisplayMode.None,
+            _ => LogDisplayMode.Full,
+        };
     }
 
     private void EnqueueLog(
@@ -1356,6 +1411,17 @@ public class MainForm : Form
     {
         if (_logDisplayMode == LogDisplayMode.Full)
             return entry.ShowInFullMode;
+
+        if (_logDisplayMode == LogDisplayMode.None)
+        {
+            if (!entry.ShowInFullMode)
+                return false;
+
+            if (entry.Level == LogLevel.Error)
+                return true;
+
+            return IsImportantNoneModeLog(entry.MessageStr);
+        }
 
         if (entry.ShowInSimpleMode)
             return true;
