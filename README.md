@@ -1,58 +1,174 @@
 # ⬡ WebInterceptor
 
-一个基于 **WebView2 + HTTP 本地服务** 的网络请求拦截工具，支持多实例并发、深色主题 GUI 以及灵活的拦截策略。
+> 基于 WebView2 的本地 HTTP 网络请求拦截工具，通过内嵌真实浏览器引擎抓取动态加载的 XHR / Fetch 数据，并以 REST API 的形式对外暴露，适合爬虫、自动化测试等场景。
+
+![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
+![Runtime](https://img.shields.io/badge/.NET-8%2B-purple?logo=dotnet)
+![WebView2](https://img.shields.io/badge/WebView2-Required-orange)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
 ## ✨ 功能特性
 
-- **HTTP 本地服务**：监听本地端口（默认 `8888`），对外暴露 `POST /intercept` 接口，任何语言均可调用
-- **多 WebView2 实例池**：可配置 1–20 个并发实例，每个实例独立展示在 Tab 中，支持实时调整
-- **三种拦截模式**：
-  - **无 Filter 模式**：导航后返回完整页面 HTML
-  - **立即返回模式**：监听指定 URL 关键词，第一个匹配即返回
-  - **完整加载模式**（`wait_for_complete`）：等待页面加载完毕，收集所有匹配响应后统一返回
-- **请求/响应数据采集**：可选返回 Body、Headers、Cookies
-- **FIFO 实例锁定**：通过 `instances` 参数指定实例 ID，同一实例的请求严格按到达顺序处理
-- **实时统计面板**：总请求数、成功、失败、超时、平均响应时间及各实例状态
-- **系统托盘**：关闭窗口后最小化到托盘，不终止服务
-- **深色主题 GUI**：VS Code Dark+ 风格界面
-- **CORS 支持**：允许跨域调用
+- **真实浏览器引擎**：基于 Microsoft WebView2（Chromium），完整执行 JavaScript，无需模拟或逆向分析接口
+- **多实例并发**：可配置 1–20 个 WebView2 实例组成资源池，支持并发请求，内置公平调度队列
+- **灵活拦截模式**：
+  - **即时模式**（默认）：一旦拦截到匹配响应立即返回
+  - **完整加载模式**（`wait_for_complete`）：等待页面 `NavigationCompleted` 后再收集所有匹配响应
+- **URL 过滤**：通过 `filter` 字符串精确匹配目标 XHR/Fetch 请求 URL
+- **可选载荷**：按需返回响应 Body、Headers、Cookies
+- **图片直传**：自动识别图片 URL（`.webp/.jpg/.jpeg/.png/.gif`），代理下载并以正确 Content-Type 返回
+- **页面快照**：可获取当前页面完整 HTML（`readyState` 感知）
+- **统计面板**：实时显示总请求数、成功 / 失败 / 超时计数及平均耗时
+- **深色 UI**：VS Code Dark+ 风格的 WinForms 界面，实例状态实时可视化
+- **系统托盘**：关闭窗口后最小化到托盘，后台持续运行
+- **热配置**：界面直接修改端口 / 实例数，无需重启程序；配置自动持久化到 `config.ini`
 
 ---
 
-## 🖥️ 运行环境
+## 🖼️ 界面预览
 
-| 依赖 | 要求 |
+```
+┌─────────────────────────────────────────────────────────────┐
+│ ⬡ WebInterceptor    实例数 [5▾]   端口 [8888]  [应用]       │
+├─────────────────────────────────────────────────────────────┤
+│ STATS  总计 42  成功 38  失败 2  超时 2  均耗 1240ms │ 实例状态 … │
+├─────────────────────────────────────────────────────────────┤
+│  实例 #1 │ 实例 #2 │ 实例 #3 │ 实例 #4 │ 实例 #5            │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  <WebView2 内嵌浏览器预览>                           │   │
+│  └──────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
+│ OUTPUT                               [完整▾]  [清空]        │
+│  12:34:01  实例 #1  →  https://example.com/api/data         │
+│  12:34:02  实例 #1  拦截成功  3821 字节                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🔧 环境要求
+
+| 依赖 | 版本 |
 |------|------|
-| 操作系统 | Windows 10 / 11（64-bit） |
-| .NET | .NET 8 或更高 |
-| WebView2 Runtime | [Microsoft Edge WebView2](https://developer.microsoft.com/microsoft-edge/webview2/)（大部分 Win10/11 已内置） |
-| NuGet 包 | `Microsoft.Web.WebView2`、`System.Threading.Tasks.Dataflow` |
+| Windows | 10 / 11（x64） |
+| .NET | 8.0 或更高 |
+| Microsoft WebView2 Runtime | 最新版（随 Edge 自动安装） |
+
+> 若系统尚未安装 WebView2 Runtime，可从 [Microsoft 官网](https://developer.microsoft.com/microsoft-edge/webview2/) 下载安装。
 
 ---
 
 ## 🚀 快速开始
 
-### 1. 编译
+### 1. 克隆 & 编译
 
 ```bash
+git clone https://github.com/yourname/WebInterceptor.git
+cd WebInterceptor
 dotnet build -c Release
 ```
 
 ### 2. 运行
 
-直接双击生成的 `.exe`，或：
-
 ```bash
 dotnet run
+# 或直接双击 Release 目录下的 WebInterceptor.exe
 ```
 
-程序启动后自动监听 `http://0.0.0.0:8888/intercept`。
+程序启动后将在 `http://localhost:8888` 监听请求（端口可在界面或 `config.ini` 中修改）。
 
-### 3. 配置（可选）
+---
 
-程序目录下的 `config.ini` 会在首次启动时自动生成：
+## 📡 API 使用
+
+所有请求均以 `POST /` 方式发送，Body 为 JSON。
+
+### 请求参数
+
+| 字段 | 类型 | 必须 | 默认值 | 说明 |
+|------|------|:----:|--------|------|
+| `url` | `string` | ✅ | — | 要导航到的目标页面 URL |
+| `filter` | `string` | | `""` | 过滤拦截的 XHR/Fetch URL（子字符串匹配） |
+| `timeout_seconds` | `int` | | `30` | 超时秒数 |
+| `keep_page` | `bool` | | `false` | `true` 保留当前页面不重新导航 |
+| `wait_for_complete` | `bool` | | `false` | `true` 等待页面完全加载后再返回 |
+| `include_body` | `bool` | | `true` | 是否在响应中包含 Body |
+| `include_headers` | `bool` | | `false` | 是否在响应中包含 Headers |
+| `instances` | `string` | | — | 指定使用的实例 ID，如 `"1"` 或 `"1,3"` |
+| `collect_delay_seconds` | `int` | | `2` | 完整加载模式下导航完成后额外等待秒数（0–30） |
+
+### 示例：即时拦截
+
+```bash
+curl -X POST http://localhost:8888 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/page",
+    "filter": "/api/data",
+    "timeout_seconds": 15,
+    "include_body": true,
+    "include_headers": false
+  }'
+```
+
+### 示例：完整加载模式
+
+```bash
+curl -X POST http://localhost:8888 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/page",
+    "filter": "/api/list",
+    "wait_for_complete": true,
+    "collect_delay_seconds": 3
+  }'
+```
+
+### 成功响应（`200 OK`）
+
+即时模式返回单条数据：
+
+```json
+{
+  "requestUrl": "https://example.com/api/data?page=1",
+  "body": "{\"items\":[...]}",
+  "headers": null,
+  "cookies": { "session": "abc123" }
+}
+```
+
+完整加载模式返回数组：
+
+```json
+{
+  "items": [
+    {
+      "requestUrl": "https://example.com/api/list?page=1",
+      "body": "...",
+      "headers": null,
+      "cookies": {}
+    },
+    { "..." }
+  ]
+}
+```
+
+### 错误响应
+
+| HTTP 状态码 | 含义 |
+|-------------|------|
+| `400` | 请求参数缺失或格式错误 |
+| `404` | 页面加载完成但未找到匹配内容 |
+| `504` | 超时未拦截到数据 |
+| `500` | 内部异常 |
+
+---
+
+## ⚙️ 配置文件
+
+程序首次运行时自动生成 `config.ini`（与 `.exe` 同目录）：
 
 ```ini
 ; WebInterceptor 配置文件
@@ -63,133 +179,12 @@ port = 8888
 
 [webview2]
 instance_count = 5
+
+[log]
+display_mode = full   ; full | simple
 ```
 
-也可以在 GUI 中直接修改端口和实例数，点击 **应用** 后立即生效并保存。
-
----
-
-## 📡 API 文档
-
-### 端点
-
-```
-POST http://localhost:8888/intercept
-Content-Type: application/json
-```
-
-### 请求参数
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `url` | `string` | ✅ | 要导航的目标 URL |
-| `filter` | `string` | ❌ | 拦截的 URL 关键词（为空时返回页面 HTML） |
-| `timeout_seconds` | `int` | ❌ | 超时秒数，默认 `30`（无 Filter 模式默认 `60`） |
-| `keep_page` | `bool` | ❌ | `true` 表示拦截完成后保留当前页面，默认 `false`（跳回空白页） |
-| `wait_for_complete` | `bool` | ❌ | `true` 开启完整加载模式，收集所有匹配后返回，默认 `false` |
-| `include_body` | `bool` | ❌ | 是否返回响应 Body，默认 `true`（完整加载模式）/ `false`（无 Filter 模式） |
-| `include_headers` | `bool` | ❌ | 是否返回响应 Headers，默认 `false` |
-| `instances` | `string` | ❌ | 指定实例 ID（逗号分隔，如 `"1,2,!3"`），不填则自动分配 |
-| `collect_delay_seconds` | `int` | ❌ | 完整加载模式下导航完成后的额外等待时间，默认 `2`，最大 `30` |
-
-### 响应格式
-
-**立即返回模式（有 Filter）**
-
-```json
-{
-  "requestUrl": "https://api.example.com/data?token=xxx",
-  "body": "{ \"key\": \"value\" }",
-  "headers": { "Content-Type": "application/json" },
-  "cookies": { "session": "abc123" }
-}
-```
-
-**完整加载模式（`wait_for_complete: true`）**
-
-```json
-{
-  "items": [
-    {
-      "requestUrl": "https://api.example.com/list",
-      "body": "...",
-      "headers": { "Content-Type": "application/json" }
-    }
-  ]
-}
-```
-
-**无 Filter 模式（返回 HTML）**
-
-```
-HTTP 200  text/html; charset=utf-8
-<html>...</html>
-```
-
-若请求了 `include_headers` 或 `include_body`，返回 JSON 格式：
-
-```json
-{
-  "html": "<html>...</html>",
-  "headers": { "Content-Type": "text/html" }
-}
-```
-
-### 错误码
-
-| 状态码 | 含义 |
-|--------|------|
-| `400` | 请求参数错误 |
-| `404` | 页面加载完成但未匹配到内容 |
-| `429` | 并发超限（最多 10 个并发请求） |
-| `500` | 内部错误 |
-| `503` | WebView2 实例池不可用 |
-| `504` | 超时 |
-
----
-
-## 💡 调用示例
-
-### Python
-
-```python
-import requests
-
-resp = requests.post("http://localhost:8888/intercept", json={
-    "url": "https://example.com",
-    "filter": "api/data",
-    "timeout_seconds": 30,
-    "include_body": True,
-    "include_headers": False
-})
-
-print(resp.json())
-```
-
-### curl
-
-```bash
-curl -X POST http://localhost:8888/intercept \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com","filter":"api/data","timeout_seconds":30}'
-```
-
-### JavaScript (fetch)
-
-```js
-const res = await fetch("http://localhost:8888/intercept", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    url: "https://example.com",
-    filter: "api/data",
-    wait_for_complete: true,
-    collect_delay_seconds: 3
-  })
-});
-const data = await res.json();
-console.log(data.items);
-```
+也可直接在程序界面修改实例数和端口后点击「应用」，配置将自动写入 `config.ini`。
 
 ---
 
@@ -198,33 +193,63 @@ console.log(data.items);
 ```
 WebInterceptor/
 ├── Program.cs          # 全部源码（单文件）
-├── config.ini          # 运行时配置（自动生成）
-├── icon.ico            # 可选：自定义托盘图标
+├── config.ini          # 运行时自动生成的配置文件
+├── icon.ico            # 可选自定义图标
 └── README.md
 ```
 
 ---
 
-## ⚙️ 高级说明
+## 🔍 工作原理
 
-### 实例调度
+```
+外部调用方
+    │  POST http://localhost:8888  { url, filter, ... }
+    ▼
+HttpListener（C# 内置）
+    │
+    ▼
+实例调度器（SemaphoreSlim + FIFO 队列）
+    │  从 WebView2 池中获取空闲实例
+    ▼
+WebView2 实例
+    ├─ Navigate(url)
+    ├─ WebResourceResponseReceived 事件
+    │      └─ 匹配 filter → 读取 Body / Headers / Cookies
+    └─ NavigationCompleted（完整加载模式）
+    │
+    ▼
+序列化 → 返回 JSON 给调用方
+```
 
-- 默认情况下从公共池中取空闲实例（先进先出）
-- 通过 `instances` 字段可指定固定实例，多个请求指定同一实例时自动排队（FIFO），保证顺序
-- 临时超出配置实例数时可动态扩充，超出部分使用后销毁
+---
 
-### 并发限制
+## 🛠️ 常见问题
 
-- HTTP 请求并发上限：**10**（超出返回 `429`）
-- WebView2 实例并发上限：由 `instance_count` 决定（最多 20）
+**Q: 端口被占用怎么办？**  
+A: 在界面顶部修改端口号后点击「应用」，或修改 `config.ini` 中的 `port` 后重启程序。
 
-### 内存管理
+**Q: 拦截不到数据，一直超时？**  
+A: 检查 `filter` 是否匹配目标请求 URL 的子字符串；可先将 `filter` 置空拦截所有请求进行调试。
 
-- 每次请求完成后默认导航回 `about:blank` 释放页面资源
-- 设置 `keep_page: true` 可跳过此步骤（适合连续操作同一页面）
+**Q: 是否支持需要登录的页面？**  
+A: 支持。WebView2 实例共享本机的 Edge 用户数据目录，可在实例内手动完成登录后再发起拦截请求。
+
+**Q: 如何在 Python 中调用？**  
+```python
+import requests, json
+
+resp = requests.post("http://localhost:8888", json={
+    "url": "https://example.com/page",
+    "filter": "/api/data",
+    "timeout_seconds": 20
+})
+data = resp.json()
+print(data["body"])
+```
 
 ---
 
 ## 📄 License
 
-MIT
+[MIT](LICENSE)
