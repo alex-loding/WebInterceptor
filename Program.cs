@@ -60,11 +60,23 @@ internal static class Program
     }
 }
 
-record InterceptRequest(string Url, string Filter, int? timeout_seconds = null, bool? keep_page = null, bool? wait_for_complete = null, bool? include_body = null, string? instances = null, bool? include_headers = null, int? collect_delay_seconds = null);
+record InterceptRequest(string Url, string Filter = "", int? timeout_seconds = null, bool? keep_page = null, bool? wait_for_complete = null, bool? include_body = null, string? instances = null, bool? include_headers = null, int? collect_delay_seconds = null);
 record InterceptedChunk(string RequestUrl, string? Body = null, Dictionary<string, string>? Headers = null, Dictionary<string, string>? Cookies = null);
 
 public class MainForm : Form
 {
+    private sealed record DocumentSnapshotPayload(string Html, string ReadyState);
+    private sealed record DocumentSnapshot(string Source, string ReadyState, string Html);
+
+    private static readonly HashSet<string> _supportedImageExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".webp",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif"
+    };
+
     private static readonly JsonSerializerOptions _requestJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -73,6 +85,49 @@ public class MainForm : Form
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/124.0.0.0 Safari/537.36";
+
+    private static bool IsSupportedDirectImageUrl(string rawUrl)
+    {
+        if (!Uri.TryCreate(rawUrl, UriKind.Absolute, out var uri)) return false;
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var extension = Path.GetExtension(uri.AbsolutePath);
+        return !string.IsNullOrWhiteSpace(extension) && _supportedImageExtensions.Contains(extension);
+    }
+
+    private static string GuessImageContentType(string rawUrl)
+    {
+        if (!Uri.TryCreate(rawUrl, UriKind.Absolute, out var uri))
+            return "application/octet-stream";
+
+        return Path.GetExtension(uri.AbsolutePath).ToLowerInvariant() switch
+        {
+            ".webp" => "image/webp",
+            ".jpg" => "image/jpeg",
+            ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            _ => "application/octet-stream"
+        };
+    }
+
+    private static bool IsSameRequestUrl(string expectedUrl, string actualUrl)
+    {
+        if (!Uri.TryCreate(expectedUrl, UriKind.Absolute, out var expectedUri)) return false;
+        if (!Uri.TryCreate(actualUrl, UriKind.Absolute, out var actualUri)) return false;
+
+        return Uri.Compare(
+            expectedUri,
+            actualUri,
+            UriComponents.SchemeAndServer | UriComponents.PathAndQuery,
+            UriFormat.SafeUnescaped,
+            StringComparison.OrdinalIgnoreCase) == 0;
+    }
 
     private static void HandleNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
@@ -936,6 +991,174 @@ public class MainForm : Form
         catch { }
     }
 
+    private Task<T> RunOnUiThreadAsync<T>(Func<Task<T>> action)
+    {
+        if (IsDisposed)
+            return Task.FromException<T>(new ObjectDisposedException(nameof(MainForm)));
+
+        if (!InvokeRequired)
+            return action();
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        try
+        {
+            BeginInvoke((Action)(() =>
+            {
+                _ = ExecuteAsync();
+
+                async Task ExecuteAsync()
+                {
+                    try
+                    {
+                        tcs.TrySetResult(await action());
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                }
+            }));
+        }
+        catch (Exception ex)
+        {
+            tcs.TrySetException(ex);
+        }
+
+        return tcs.Task;
+    }
+
+    private static bool IsUsableDocumentSource(string? source)
+    {
+        if (string.IsNullOrWhiteSpace(source)) return false;
+        if (string.Equals(source, "about:blank", StringComparison.OrdinalIgnoreCase)) return false;
+        if (source.StartsWith("chrome-error://", StringComparison.OrdinalIgnoreCase)) return false;
+        return true;
+    }
+
+    private static bool IsReadyPlaceholderHtml(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html)) return false;
+
+        return html.Contains("letter-spacing:2px>READY", StringComparison.OrdinalIgnoreCase) ||
+               (html.Contains("background:#1e1e1e", StringComparison.OrdinalIgnoreCase) &&
+                html.Contains(">READY<", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task<DocumentSnapshot> CaptureDocumentSnapshotAsync(WebView2 webView)
+    {
+        return await RunOnUiThreadAsync(async () =>
+        {
+            if (webView.IsDisposed || webView.CoreWebView2 == null)
+                return new DocumentSnapshot(string.Empty, string.Empty, string.Empty);
+
+            var source = webView.CoreWebView2.Source ?? string.Empty;
+            var scriptResult = await webView.CoreWebView2.ExecuteScriptAsync(
+                "(() => ({ Html: document.documentElement ? document.documentElement.outerHTML : '', ReadyState: document.readyState }))();");
+            var payload = JsonSerializer.Deserialize<DocumentSnapshotPayload>(scriptResult);
+
+            return new DocumentSnapshot(
+                source,
+                payload?.ReadyState ?? string.Empty,
+                payload?.Html ?? string.Empty);
+        });
+    }
+
+    private async Task<DocumentSnapshot> CaptureSettledDocumentAsync(WebView2 webView, int instanceId, InterceptRequest req)
+    {
+        int settleWindowSeconds = Math.Clamp(req.collect_delay_seconds ?? 1, 0, 10);
+        int maxAttempts = Math.Max(1, (settleWindowSeconds * 1000 / 250) + 1);
+        DocumentSnapshot? bestSnapshot = null;
+        string lastStableSource = string.Empty;
+        int lastStableLength = -1;
+        int stableHits = 0;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            DocumentSnapshot snapshot;
+            try
+            {
+                snapshot = await CaptureDocumentSnapshotAsync(webView);
+            }
+            catch (Exception ex)
+            {
+                if (attempt == maxAttempts - 1) throw;
+
+                Log($"实例 #{instanceId}  抓取页面快照失败，第 {attempt + 1} 次重试: {ex.Message}", LogLevel.Warning);
+                await Task.Delay(250);
+                continue;
+            }
+
+            if (bestSnapshot == null || snapshot.Html.Length >= bestSnapshot.Html.Length)
+                bestSnapshot = snapshot;
+
+            bool looksStable =
+                string.Equals(snapshot.ReadyState, "complete", StringComparison.OrdinalIgnoreCase) &&
+                IsUsableDocumentSource(snapshot.Source) &&
+                !string.IsNullOrWhiteSpace(snapshot.Html) &&
+                !IsReadyPlaceholderHtml(snapshot.Html);
+
+            if (looksStable)
+            {
+                if (string.Equals(snapshot.Source, lastStableSource, StringComparison.OrdinalIgnoreCase) &&
+                    snapshot.Html.Length >= lastStableLength)
+                {
+                    stableHits++;
+                }
+                else
+                {
+                    stableHits = 1;
+                }
+
+                lastStableSource = snapshot.Source;
+                lastStableLength = snapshot.Html.Length;
+
+                if (stableHits >= 2 || maxAttempts == 1)
+                    return snapshot;
+            }
+            else
+            {
+                stableHits = 0;
+                lastStableSource = snapshot.Source;
+                lastStableLength = snapshot.Html.Length;
+            }
+
+            if (attempt < maxAttempts - 1)
+                await Task.Delay(250);
+        }
+
+        return bestSnapshot ?? new DocumentSnapshot(string.Empty, string.Empty, string.Empty);
+    }
+
+    private async Task<(WebView2 WebView, int InstanceId)> CreateTemporaryWebViewInstanceAsync()
+    {
+        return await RunOnUiThreadAsync(async () =>
+        {
+            var tempWebView = new WebView2();
+            var tempInstanceId = Interlocked.Increment(ref _nextInstanceId);
+            var userDataFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WebInterceptor", $"WebView2Temp_{Guid.NewGuid()}");
+
+            var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+            await tempWebView.EnsureCoreWebView2Async(env);
+
+            ConfigureWebView2(tempWebView);
+            RegisterWebResourceEvent(tempWebView, tempInstanceId);
+
+            _tempInstanceIds.TryAdd(tempInstanceId, true);
+            var newInstance = (tempWebView, tempInstanceId);
+
+            lock (_instancesLock)
+            {
+                _allInstances.Add(newInstance);
+            }
+
+            CreateTabForInstance(tempWebView, tempInstanceId);
+            return newInstance;
+        });
+    }
+
     // ── 请求获取实例时仅激活对应标签页（超轻量）──
     private void ActivateTabForInstance(int instanceId)
     {
@@ -1460,6 +1683,48 @@ public class MainForm : Form
             }
         }
 
+        bool TryTakeInstanceFromQueue(int targetInstanceId, out (WebView2, int) picked)
+        {
+            var tempQueue = new ConcurrentQueue<(WebView2, int)>();
+            picked = default;
+            bool found = false;
+            while (_webViewQueue.TryDequeue(out var item))
+            {
+                if (!found && item.Item2 == targetInstanceId)
+                {
+                    picked = item;
+                    found = true;
+                    Log($"从队列中移除实例 #{targetInstanceId}", LogLevel.Debug);
+                    continue;
+                }
+                tempQueue.Enqueue(item);
+            }
+            while (tempQueue.TryDequeue(out var item)) _webViewQueue.Enqueue(item);
+            return found;
+        }
+
+        void RemoveWaiterFromInstance(int instanceId, TaskCompletionSource<(WebView2, int)> waiter)
+        {
+            var waiterLock = _instanceWaitersLock.GetOrAdd(instanceId, _ => new object());
+            lock (waiterLock)
+            {
+                if (_instanceWaiters.TryGetValue(instanceId, out var q))
+                {
+                    var filtered = new Queue<TaskCompletionSource<(WebView2, int)>>(q.Where(t => t != waiter));
+                    if (filtered.Count > 0) _instanceWaiters[instanceId] = filtered;
+                    else _instanceWaiters.TryRemove(instanceId, out _);
+                }
+            }
+        }
+
+        void RemoveWaiterFromInstances(IEnumerable<int> instanceIds, TaskCompletionSource<(WebView2, int)> waiter)
+        {
+            foreach (var instanceId in instanceIds)
+            {
+                RemoveWaiterFromInstance(instanceId, waiter);
+            }
+        }
+
         SemaphoreSlim leaseSemaphore = _poolSemaphore;
         bool slotHeld = false;
         var excludedInstanceSet = new HashSet<int>();
@@ -1540,107 +1805,114 @@ public class MainForm : Form
                     
                     if (specifiedInstances.Count > 0)
                     {
-                        // 有指定实例，只使用这些实例（排除其中的排除项）
-                        candidateInstances = allAvailableInstances
-                            .Where(i => specifiedInstances.Contains(i.Item2) && !excludedInstances.Contains(i.Item2))
+                        // 有指定实例：按用户输入顺序选择候选（并去重）
+                        var orderedSpecified = specifiedInstances
+                            .Where(id => !excludedInstances.Contains(id))
+                            .Distinct()
+                            .ToList();
+                        var instanceMap = allAvailableInstances.ToDictionary(i => i.Item2, i => i.Item1);
+                        candidateInstances = orderedSpecified
+                            .Where(id => instanceMap.ContainsKey(id))
+                            .Select(id => (instanceMap[id], id))
                             .ToList();
                         Log($"从指定实例中选择，候选实例数: {candidateInstances.Count}", LogLevel.Request);
                         
                         if (candidateInstances.Count > 0)
                         {
-                            // 尝试按顺序使用候选实例
+                            var waitAnyCandidateIds = new List<int>();
+
+                            // 先按顺序尝试拿空闲实例；忙则跳到下一个
                             foreach (var candidateInstance in candidateInstances)
                             {
                                 int instanceId = candidateInstance.Item2;
                                 Log($"尝试使用实例 #{instanceId}", LogLevel.Request);
                                 
                                 bool isCoreWebView2Ready = false;
-                                bool foundInQueue = false;
                                 
                                 // UI 线程检查 CoreWebView2
                                 Invoke(() => { isCoreWebView2Ready = candidateInstance.Item1.CoreWebView2 != null; });
                                 
-                                if (isCoreWebView2Ready)
-                                {
-                                    Log($"使用指定实例 #{instanceId}", LogLevel.Request);
-                                    
-                                    // 从队列中移除该实例，记录是否在队列中
-                                    var tempQueue = new ConcurrentQueue<(WebView2, int)>();
-                                    while (_webViewQueue.TryDequeue(out var item))
-                                    {
-                                        if (item.Item2 != instanceId) tempQueue.Enqueue(item);
-                                        else { foundInQueue = true; Log($"从队列中移除实例 #{instanceId}", LogLevel.Debug); }
-                                    }
-                                    while (tempQueue.TryDequeue(out var item)) _webViewQueue.Enqueue(item);
-                                    
-                                    if (!foundInQueue)
-                                    {
-                                        // 实例正被其他请求占用：
-                                        // 1. 释放刚才多占的 semaphore 槽（本请求不走正常队列路径）
-                                        // 2. 把自己的 TCS 按 FIFO 入队，等待实例归还时被唤醒
-                                        leaseSemaphore.Release();
-                                        slotHeld = false;
-                                        Log($"指定实例 #{instanceId} 正忙，FIFO 排队等待...", LogLevel.Warning);
-                                        
-                                        var tcs = new TaskCompletionSource<(WebView2, int)>(TaskCreationOptions.RunContinuationsAsynchronously);
-                                        var waiterLock = _instanceWaitersLock.GetOrAdd(instanceId, _ => new object());
-                                        lock (waiterLock)
-                                        {
-                                            var queue = _instanceWaiters.GetOrAdd(instanceId, _ => new Queue<TaskCompletionSource<(WebView2, int)>>());
-                                            queue.Enqueue(tcs);
-                                        }
-                                        
-                                        // 使用请求超时时间等待被唤醒（最长 120 秒）
-                                        int timeoutMs = (req?.timeout_seconds ?? 120) * 1000;
-                                        using var cts = new CancellationTokenSource(timeoutMs);
-                                        cts.Token.Register(() => tcs.TrySetCanceled(), useSynchronizationContext: false);
-                                        
-                                        (WebView2, int) granted;
-                                        try
-                                        {
-                                            granted = await tcs.Task;
-                                            // 修复问题4：等待者被唤醒时没有持有 semaphore 槽
-                                            // 必须重新 WaitAsync 占槽，否则 ReturnWebViewToPool 的 finally Release() 会 double-release
-                                            leaseSemaphore = await WaitPoolSlotAsync();
-                                            slotHeld = true;
-                                        }
-                                        catch (OperationCanceledException)
-                                        {
-                                            // 超时：从等待队列中移除自己
-                                            lock (waiterLock)
-                                            {
-                                                if (_instanceWaiters.TryGetValue(instanceId, out var q))
-                                                {
-                                                    // 重建队列，跳过已取消的 tcs
-                                                    var tmp = new Queue<TaskCompletionSource<(WebView2, int)>>(q.Where(t => t != tcs));
-                                                    _instanceWaiters[instanceId] = tmp;
-                                                }
-                                            }
-                                            Log($"等待指定实例 #{instanceId} 超时，使用默认分配", LogLevel.Warning);
-                                            // 超时后走默认队列分配，需要重新 WaitAsync 占槽
-                                            leaseSemaphore = await WaitPoolSlotAsync();
-                                            slotHeld = true;
-                                            goto defaultAllocation;
-                                        }
-                                        
-                                        // 被唤醒时 granted 就是已从队列取走的实例，直接走 UI 创建标签页
-                                        // 轻量：标签页在 init 时已建好，这里只激活
-                                        BeginInvoke(() => ActivateTabForInstance(granted.Item2));
-                                        Log($"使用指定实例 #{granted.Item2} 成功", LogLevel.Success);
-                                        return (granted.Item1, granted.Item2, leaseSemaphore);
-                                    }
-                                    
-                                    // 轻量：标签页在 init 时已建好，这里只激活
-                                    BeginInvoke(() => ActivateTabForInstance(instanceId));
-                                    
-                                    Log($"使用指定实例 #{instanceId} 成功", LogLevel.Success);
-                                    return (candidateInstance.Item1, candidateInstance.Item2, leaseSemaphore);
-                                }
-                                else
+                                if (!isCoreWebView2Ready)
                                 {
                                     Log($"实例 #{instanceId} 的CoreWebView2不可用，尝试下一个", LogLevel.Warning);
+                                    continue;
                                 }
+
+                                waitAnyCandidateIds.Add(instanceId);
+                                if (TryTakeInstanceFromQueue(instanceId, out var pickedInstance))
+                                {
+                                    // 轻量：标签页在 init 时已建好，这里只激活
+                                    BeginInvoke(() => ActivateTabForInstance(instanceId));
+                                    Log($"使用指定实例 #{instanceId} 成功", LogLevel.Success);
+                                    return (pickedInstance.Item1, pickedInstance.Item2, leaseSemaphore);
+                                }
+
+                                Log($"指定实例 #{instanceId} 正忙，尝试下一个候选实例", LogLevel.Warning);
                             }
+
+                            if (waitAnyCandidateIds.Count > 0)
+                            {
+                                // 全部候选都忙：等待任一候选实例归还（谁先空闲就用谁）
+                                leaseSemaphore.Release();
+                                slotHeld = false;
+                                Log($"候选实例均忙，等待任一候选实例可用: {string.Join(',', waitAnyCandidateIds)}", LogLevel.Warning);
+
+                                var tcs = new TaskCompletionSource<(WebView2, int)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                                foreach (var instanceId in waitAnyCandidateIds)
+                                {
+                                    var waiterLock = _instanceWaitersLock.GetOrAdd(instanceId, _ => new object());
+                                    lock (waiterLock)
+                                    {
+                                        var queue = _instanceWaiters.GetOrAdd(instanceId, _ => new Queue<TaskCompletionSource<(WebView2, int)>>());
+                                        queue.Enqueue(tcs);
+                                    }
+                                }
+
+                                // 二次快速检查：避免“刚入等待队列时实例已归还到公共队列”导致漏接
+                                foreach (var instanceId in waitAnyCandidateIds)
+                                {
+                                    if (TryTakeInstanceFromQueue(instanceId, out var pickedAfterSubscribe))
+                                    {
+                                        RemoveWaiterFromInstances(waitAnyCandidateIds, tcs);
+                                        leaseSemaphore = await WaitPoolSlotAsync();
+                                        slotHeld = true;
+                                        BeginInvoke(() => ActivateTabForInstance(instanceId));
+                                        Log($"使用指定实例 #{instanceId} 成功", LogLevel.Success);
+                                        return (pickedAfterSubscribe.Item1, pickedAfterSubscribe.Item2, leaseSemaphore);
+                                    }
+                                }
+
+                                int timeoutMs = (req?.timeout_seconds ?? 120) * 1000;
+                                using var cts = new CancellationTokenSource(timeoutMs);
+                                using var reg = cts.Token.Register(() => tcs.TrySetCanceled(), useSynchronizationContext: false);
+
+                                (WebView2, int) granted;
+                                try
+                                {
+                                    granted = await tcs.Task;
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    RemoveWaiterFromInstances(waitAnyCandidateIds, tcs);
+                                    Log($"等待候选实例超时（{string.Join(',', waitAnyCandidateIds)}），使用默认分配", LogLevel.Warning);
+                                    leaseSemaphore = await WaitPoolSlotAsync();
+                                    slotHeld = true;
+                                    goto defaultAllocation;
+                                }
+
+                                RemoveWaiterFromInstances(waitAnyCandidateIds, tcs);
+
+                                // 修复问题4：等待者被唤醒时没有持有 semaphore 槽
+                                // 必须重新 WaitAsync 占槽，否则 ReturnWebViewToPool 的 finally Release() 会 double-release
+                                leaseSemaphore = await WaitPoolSlotAsync();
+                                slotHeld = true;
+
+                                // 轻量：标签页在 init 时已建好，这里只激活
+                                BeginInvoke(() => ActivateTabForInstance(granted.Item2));
+                                Log($"使用指定实例 #{granted.Item2} 成功", LogLevel.Success);
+                                return (granted.Item1, granted.Item2, leaseSemaphore);
+                            }
+
                             Log("所有候选实例都不可用，使用默认分配", LogLevel.Warning);
                         }
                         else
@@ -1699,40 +1971,67 @@ public class MainForm : Form
                     attempts++;
                 }
             }
-            
+
+            var waitAnyAvailableIds = new List<int>();
+            lock (_instancesLock)
+            {
+                waitAnyAvailableIds = _allInstances
+                    .Select(i => i.Item2)
+                    .Where(id => !excludedInstanceSet.Contains(id))
+                    .Distinct()
+                    .ToList();
+            }
+
+            if (waitAnyAvailableIds.Count > 0)
+            {
+                Log($"公共队列暂无可用实例，等待非排除实例归还: {string.Join(',', waitAnyAvailableIds)}", LogLevel.Warning);
+
+                var tcs = new TaskCompletionSource<(WebView2, int)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                foreach (var instanceId in waitAnyAvailableIds)
+                {
+                    var waiterLock = _instanceWaitersLock.GetOrAdd(instanceId, _ => new object());
+                    lock (waiterLock)
+                    {
+                        var queue = _instanceWaiters.GetOrAdd(instanceId, _ => new Queue<TaskCompletionSource<(WebView2, int)>>());
+                        queue.Enqueue(tcs);
+                    }
+                }
+
+                foreach (var instanceId in waitAnyAvailableIds)
+                {
+                    if (TryTakeInstanceFromQueue(instanceId, out var pickedAfterSubscribe))
+                    {
+                        RemoveWaiterFromInstances(waitAnyAvailableIds, tcs);
+                        BeginInvoke(() => ActivateTabForInstance(instanceId));
+                        Log($"使用等待归还的实例 #{instanceId} 成功", LogLevel.Success);
+                        return (pickedAfterSubscribe.Item1, pickedAfterSubscribe.Item2, leaseSemaphore);
+                    }
+                }
+
+                int timeoutMs = Math.Clamp(req?.timeout_seconds ?? 120, 1, 300) * 1000;
+                using var cts = new CancellationTokenSource(timeoutMs);
+                using var reg = cts.Token.Register(() => tcs.TrySetCanceled(), useSynchronizationContext: false);
+
+                try
+                {
+                    var granted = await tcs.Task;
+                    RemoveWaiterFromInstances(waitAnyAvailableIds, tcs);
+                    BeginInvoke(() => ActivateTabForInstance(granted.Item2));
+                    Log($"使用等待归还的实例 #{granted.Item2} 成功", LogLevel.Success);
+                    return (granted.Item1, granted.Item2, leaseSemaphore);
+                }
+                catch (OperationCanceledException)
+                {
+                    RemoveWaiterFromInstances(waitAnyAvailableIds, tcs);
+                    Log($"等待非排除实例归还超时（{string.Join(',', waitAnyAvailableIds)}），改为创建临时实例", LogLevel.Warning);
+                }
+            }
+
             // 修复5：临时实例用完后直接销毁而不归还队列，避免队列实例数超过 semaphore maxCount
             // 临时实例由当前 WaitAsync 占用的槽对应，Release() 归还槽即可
             Log("实例池为空，创建临时实例", LogLevel.Warning);
-            var tempWebView = new WebView2();
-            var tempInstanceId = Interlocked.Increment(ref _nextInstanceId);
-            var userDataFolder = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "WebInterceptor", $"WebView2Temp_{Guid.NewGuid()}");
-            
-            var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
-            await tempWebView.EnsureCoreWebView2Async(env);
-            
-            // 配置WebView2
-            ConfigureWebView2(tempWebView);
-            
-            // 注册事件
-            RegisterWebResourceEvent(tempWebView, tempInstanceId);
-            
-            // 临时实例：instanceId 为负数标记（用负值区分），归还时走销毁路径
-            // 实际用正 tempInstanceId，但添加到 _tempInstanceIds 集合做标记
-            _tempInstanceIds.TryAdd(tempInstanceId, true);
-            var newInstance = (tempWebView, tempInstanceId);
-            Log($"临时实例 #{tempInstanceId} 已创建", LogLevel.Success);
-            
-            // 将临时实例添加到所有实例列表中（用于事件处理器查找）
-            lock (_instancesLock)
-            {
-                _allInstances.Add(newInstance);
-            }
-            
-            // 为临时实例创建标签页（复用统一方法）
-            Invoke(() => CreateTabForInstance(tempWebView, tempInstanceId));
-            
+            var newInstance = await CreateTemporaryWebViewInstanceAsync();
+            Log($"临时实例 #{newInstance.Item2} 已创建", LogLevel.Success);
             return (newInstance.Item1, newInstance.Item2, leaseSemaphore);
         }
         catch (Exception ex)
@@ -1783,11 +2082,11 @@ public class MainForm : Form
             // 导航到空白页以释放内存资源（在UI线程中执行）
             if (navigateToBlank)
             {
-                BeginInvoke(() =>
+                void ResetToReadyPage()
                 {
                     try
                     {
-                        if (webView != null && webView.CoreWebView2 != null)
+                        if (!webView.IsDisposed && webView.CoreWebView2 != null)
                         {
                             webView.CoreWebView2.NavigateToString("<html><head><meta charset=utf-8><style>body{margin:0;background:#1e1e1e;display:flex;align-items:center;justify-content:center;height:100vh;font-family:'微软雅黑',sans-serif;color:#555}</style></head><body><div style=text-align:center><div style=font-size:32px;margin-bottom:8px>◎</div><div style=font-size:13px;letter-spacing:2px>READY</div></div></body></html>");
                             Log($"实例 #{instanceId} 已重置", LogLevel.Debug);
@@ -1797,7 +2096,13 @@ public class MainForm : Form
                     {
                         Log($"实例 #{instanceId} 重置失败: {ex.Message}", LogLevel.Warning);
                     }
-                });
+                }
+
+                if (!webView.IsDisposed)
+                {
+                    if (webView.InvokeRequired) webView.Invoke((Action)ResetToReadyPage);
+                    else ResetToReadyPage();
+                }
             }
             else
             {
@@ -1814,11 +2119,23 @@ public class MainForm : Form
                 {
                     if (_instanceWaiters.TryGetValue(instanceId, out var waiters) && waiters.Count > 0)
                     {
-                        // 取出队头（最早等待的请求），直接把实例交给它
-                        var tcs = waiters.Dequeue();
-                        tcs.TrySetResult((webView, instanceId));
-                        handedToWaiter = true;
-                        Log($"实例 #{instanceId} 直接移交给下一个 FIFO 等待者", LogLevel.Debug);
+                        // 取出队头（最早等待的请求）；若队头已失效，则跳过继续找
+                        while (waiters.Count > 0)
+                        {
+                            var tcs = waiters.Dequeue();
+                            if (tcs.TrySetResult((webView, instanceId)))
+                            {
+                                handedToWaiter = true;
+                                Log($"实例 #{instanceId} 直接移交给下一个 FIFO 等待者", LogLevel.Debug);
+                                break;
+                            }
+                            Log($"实例 #{instanceId} 跳过已失效等待者", LogLevel.Debug);
+                        }
+
+                        if (waiters.Count == 0)
+                        {
+                            _instanceWaiters.TryRemove(instanceId, out _);
+                        }
                     }
                 }
 
@@ -1828,8 +2145,8 @@ public class MainForm : Form
                     _webViewQueue.Enqueue((webView, instanceId));
                     Log($"实例 #{instanceId} 已归还到公共队列", LogLevel.Debug);
                 }
-                // handedToWaiter=true 时：实例已移交，当前请求的 semaphore 槽由 finally Release() 正常归还
-                // 等待者在 tcs.Task 返回后会重新 WaitAsync 占槽，保证槽计数始终平衡
+                // handedToWaiter=true 时：实例已直接移交给等待者；
+                // 槽位平衡由等待路径各自负责（默认分配等待者沿用原槽位，指定实例等待者会重新 WaitAsync）。
             }
             else
             {
@@ -2202,7 +2519,7 @@ public class MainForm : Form
             // Filter 为空时，直接导航并返回完整网页 HTML 文本
             if (string.IsNullOrWhiteSpace(req.Filter))
             {
-                Log($"实例 #{instanceId}  Filter 为空，直接返回网页 HTML", LogLevel.Request);
+                Log($"实例 #{instanceId}  Filter 为空，本次不会进入资源拦截，按目标类型返回页面或图片数据", LogLevel.Request);
                 await HandleNoFilterMode(ctx, webView, instanceId, req);
             }
             else
@@ -2321,21 +2638,59 @@ public class MainForm : Form
         bool includeBodyRequested = req.include_body == true;
         bool includeHeadersRequested = req.include_headers == true;
         bool returnJson = includeBodyRequested || includeHeadersRequested;
+        bool isImageRequest = IsSupportedDirectImageUrl(req.Url);
         string? requestHost = null;
-        try
+        if (!isImageRequest)
         {
-            if (Uri.TryCreate(req.Url, UriKind.Absolute, out var reqUri))
-                requestHost = reqUri.Host;
+            try
+            {
+                if (Uri.TryCreate(req.Url, UriKind.Absolute, out var reqUri))
+                    requestHost = reqUri.Host;
+            }
+            catch { }
         }
-        catch { }
 
-        Log($"实例 #{instanceId}  等待页面加载完成  timeout={timeoutSeconds}s", LogLevel.Warning);
+        Log(
+            isImageRequest
+                ? $"实例 #{instanceId}  等待图片响应  timeout={timeoutSeconds}s"
+                : $"实例 #{instanceId}  等待页面加载完成  timeout={timeoutSeconds}s",
+            LogLevel.Warning);
 
         EventHandler<CoreWebView2NavigationCompletedEventArgs>? navigationCompletedHandler = null;
         EventHandler<CoreWebView2WebResourceResponseReceivedEventArgs>? responseReceivedHandler = null;
+        EventHandler<CoreWebView2WebResourceResponseReceivedEventArgs>? imageResponseHandler = null;
         var documentHeaderLock = new object();
         Dictionary<string, string>? latestDocumentHeaders = null;
         string? latestDocumentUri = null;
+        var imageResponseTcs = isImageRequest
+            ? new TaskCompletionSource<(int StatusCode, string? ContentType, byte[] Payload)>(TaskCreationOptions.RunContinuationsAsynchronously)
+            : null;
+
+        void SafeUnsubscribeResponseReceived(EventHandler<CoreWebView2WebResourceResponseReceivedEventArgs>? handler)
+        {
+            if (handler == null) return;
+
+            try
+            {
+                if (!webView.IsDisposed)
+                {
+                    if (webView.InvokeRequired)
+                    {
+                        webView.Invoke((Action)(() =>
+                        {
+                            if (webView.CoreWebView2 != null)
+                                webView.CoreWebView2.WebResourceResponseReceived -= handler;
+                        }));
+                    }
+                    else
+                    {
+                        if (webView.CoreWebView2 != null)
+                            webView.CoreWebView2.WebResourceResponseReceived -= handler;
+                    }
+                }
+            }
+            catch { }
+        }
 
         try
         {
@@ -2360,7 +2715,52 @@ public class MainForm : Form
                     }
                 };
 
-                if (includeHeadersRequested)
+                if (isImageRequest && imageResponseTcs != null)
+                {
+                    imageResponseHandler = async (sender, e) =>
+                    {
+                        if (imageResponseTcs.Task.IsCompleted) return;
+
+                        try
+                        {
+                            bool isMatchedRequest =
+                                IsSameRequestUrl(req.Url, e.Request.Uri) ||
+                                IsSupportedDirectImageUrl(e.Request.Uri);
+                            if (!isMatchedRequest) return;
+
+                            int statusCode = e.Response.StatusCode;
+                            // Redirect 响应通常不带图片实体，继续等待最终响应。
+                            if (statusCode >= 300 && statusCode < 400) return;
+
+                            string? contentType = null;
+                            foreach (var header in e.Response.Headers)
+                            {
+                                if (string.Equals(header.Key, "Content-Type", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    contentType = header.Value;
+                                    break;
+                                }
+                            }
+
+                            using var contentStream = await e.Response.GetContentAsync();
+                            using var memoryStream = new System.IO.MemoryStream();
+                            await contentStream.CopyToAsync(memoryStream);
+                            var payload = memoryStream.ToArray();
+
+                            if (imageResponseTcs.TrySetResult((statusCode, contentType, payload)))
+                            {
+                                Log($"实例 #{instanceId}  捕获图片响应  status={statusCode}  bytes={payload.Length}", LogLevel.Debug);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            imageResponseTcs.TrySetException(ex);
+                        }
+                    };
+
+                    webView.CoreWebView2.WebResourceResponseReceived += imageResponseHandler;
+                }
+                else if (includeHeadersRequested)
                 {
                     responseReceivedHandler = (sender, e) =>
                     {
@@ -2411,6 +2811,47 @@ public class MainForm : Form
 
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
             var timeoutTask = Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+
+            if (isImageRequest && imageResponseTcs != null)
+            {
+                var completedImageTask = await Task.WhenAny(imageResponseTcs.Task, timeoutTask);
+                if (completedImageTask == timeoutTask)
+                {
+                    SafeUnsubscribeNavigationCompleted(webView, navigationCompletedHandler);
+                    ctx.Response.StatusCode = 504;
+                    ctx.Response.ContentType = "application/json; charset=utf-8";
+                    var errorMsg = JsonSerializer.Serialize(new { error = "超时", message = $"{timeoutSeconds}秒内未捕获到图片响应" });
+                    var bytes = Encoding.UTF8.GetBytes(errorMsg);
+                    ctx.Response.ContentLength64 = bytes.Length;
+                    await ctx.Response.OutputStream.WriteAsync(bytes);
+                    Log($"实例 #{instanceId}  超时：{timeoutSeconds}s 内未捕获到图片响应", LogLevel.Error);
+                    Interlocked.Increment(ref _statTimeout);
+                    return;
+                }
+
+                var imageResponse = await imageResponseTcs.Task;
+                var contentType = string.IsNullOrWhiteSpace(imageResponse.ContentType)
+                    ? GuessImageContentType(req.Url)
+                    : imageResponse.ContentType!;
+                ctx.Response.StatusCode = imageResponse.StatusCode;
+                ctx.Response.ContentType = contentType;
+                ctx.Response.ContentLength64 = imageResponse.Payload.LongLength;
+                await ctx.Response.OutputStream.WriteAsync(imageResponse.Payload);
+
+                if (imageResponse.StatusCode >= 200 && imageResponse.StatusCode < 300)
+                {
+                    Log($"实例 #{instanceId}  图片已返回客户端  status={imageResponse.StatusCode}  bytes={imageResponse.Payload.Length}", LogLevel.Success);
+                    Interlocked.Increment(ref _statSuccess);
+                }
+                else
+                {
+                    Log($"实例 #{instanceId}  图片响应非成功状态  status={imageResponse.StatusCode}", LogLevel.Warning);
+                    Interlocked.Increment(ref _statFailed);
+                }
+
+                return;
+            }
+
             var completedTask = await Task.WhenAny(navigationTcs.Task, timeoutTask);
 
             if (completedTask == timeoutTask)
@@ -2427,34 +2868,39 @@ public class MainForm : Form
             }
 
             await navigationTcs.Task;
+            var snapshot = await CaptureSettledDocumentAsync(webView, instanceId, req);
+            var htmlContent = snapshot.Html;
+            bool hasStableDocument =
+                IsUsableDocumentSource(snapshot.Source) &&
+                !string.IsNullOrWhiteSpace(htmlContent) &&
+                !IsReadyPlaceholderHtml(htmlContent);
 
-            var htmlTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            webView.Invoke(() =>
+            if (!hasStableDocument)
             {
-                _ = FetchHtmlAsync();
-
-                async Task FetchHtmlAsync()
+                ctx.Response.StatusCode = 502;
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                var errorMsg = JsonSerializer.Serialize(new
                 {
-                    try
-                    {
-                        var result = await webView.CoreWebView2.ExecuteScriptAsync("document.documentElement.outerHTML");
-                        var unquoted = JsonSerializer.Deserialize<string>(result) ?? string.Empty;
-                        htmlTcs.TrySetResult(unquoted);
-                    }
-                    catch (Exception ex)
-                    {
-                        htmlTcs.TrySetException(ex);
-                    }
-                }
-            });
-
-            var htmlContent = await htmlTcs.Task;
+                    error = "抓取失败",
+                    message = "页面加载完成，但未获得稳定页面内容",
+                    source = snapshot.Source,
+                    ready_state = snapshot.ReadyState
+                });
+                var bytes = Encoding.UTF8.GetBytes(errorMsg);
+                ctx.Response.ContentLength64 = bytes.Length;
+                await ctx.Response.OutputStream.WriteAsync(bytes);
+                Log(
+                    $"实例 #{instanceId}  页面内容未稳定  source={snapshot.Source}  readyState={snapshot.ReadyState}  bytes={Encoding.UTF8.GetByteCount(htmlContent)}",
+                    LogLevel.Warning);
+                Interlocked.Increment(ref _statFailed);
+                return;
+            }
 
             if (returnJson)
             {
                 Dictionary<string, string>? headers = null;
                 Dictionary<string, string>? cookies = null;
-                string responseUri = req.Url;
+                string responseUri = snapshot.Source;
 
                 if (includeHeadersRequested)
                 {
@@ -2552,29 +2998,8 @@ public class MainForm : Form
         finally
         {
             SafeUnsubscribeNavigationCompleted(webView, navigationCompletedHandler);
-            if (responseReceivedHandler != null)
-            {
-                try
-                {
-                    if (!webView.IsDisposed)
-                    {
-                        if (webView.InvokeRequired)
-                        {
-                            webView.Invoke((Action)(() =>
-                            {
-                                if (webView.CoreWebView2 != null)
-                                    webView.CoreWebView2.WebResourceResponseReceived -= responseReceivedHandler;
-                            }));
-                        }
-                        else
-                        {
-                            if (webView.CoreWebView2 != null)
-                                webView.CoreWebView2.WebResourceResponseReceived -= responseReceivedHandler;
-                        }
-                    }
-                }
-                catch { }
-            }
+            SafeUnsubscribeResponseReceived(responseReceivedHandler);
+            SafeUnsubscribeResponseReceived(imageResponseHandler);
 
             ctx.Response.Close();
             Log($"实例 #{instanceId}  会话结束", LogLevel.Debug);
